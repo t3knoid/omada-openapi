@@ -107,3 +107,7 @@ flake8 . --max-line-length=120
 
 - [omada_network](https://github.com/t3knoid/omada_network) — exports an
   Omada site's configuration to YAML and Markdown documentation
+
+## License
+
+MIT. See [LICENSE](LICENSE).
