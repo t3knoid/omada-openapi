@@ -1,10 +1,10 @@
-"""Tests for omada.redaction."""
+"""Tests for omada_openapi.redaction."""
 
 from __future__ import annotations
 
 import pytest
 
-from omada.redaction import REDACTED, contains_secrets, is_secret_key, redact_secrets
+from omada_openapi.redaction import REDACTED, contains_secrets, is_secret_key, redact_secrets
 
 
 @pytest.mark.parametrize("key", [
@@ -56,4 +56,3 @@ def test_contains_secrets() -> None:
     assert not contains_secrets({"pskSetting": {"securityKey": REDACTED}})
     assert not contains_secrets({"password": "", "hidePwd": True, "publicKey": "PUB="})
     assert not contains_secrets("password")
-

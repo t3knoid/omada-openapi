@@ -1,19 +1,18 @@
-"""Credential redaction for exported data.
+"""Credential redaction for Omada API data.
 
-Every resource passes through :func:`redact_secrets` before it is written to
-YAML or Markdown (see :meth:`omada.service.OmadaService.fetch_all`), so a
-credential returned by any controller endpoint never reaches the exports.
+:func:`redact_secrets` masks credentials (passphrases, shared secrets,
+private keys, …) anywhere in a nested API response, so data can be logged,
+exported or displayed without leaking them.
+:meth:`omada_openapi.OmadaOpenApiClient.redact` applies it unless the client
+was told to include secrets.
 
 A value is redacted when its key looks like a credential (see
 :data:`SECRET_KEY_PATTERN`) **and** it is a non-empty string.  Booleans such
 as ``hidePwd`` / ``accountPassword`` and nested objects such as
 ``pskSetting`` are left alone (their contents are still inspected), and the
-key is kept so the export shows that a secret is configured.
-
-Redaction can be switched off with ``OmadaService(include_secrets=True)``
-(CLI ``--include-secrets`` / web UI checkbox) to produce a restorable
-backup; :func:`contains_secrets` then lets the Markdown generator flag every
-file that holds plaintext credentials.
+key is kept so the output shows that a secret is configured.
+:func:`contains_secrets` reports whether data still holds a plaintext
+credential.
 """
 
 from __future__ import annotations

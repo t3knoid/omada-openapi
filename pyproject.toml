@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omada-openapi"
+dynamic = ["version"]
+description = "Python client for the TP-Link Omada Open API (Northbound API)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+]
+keywords = ["omada", "tp-link", "openapi", "northbound", "network"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Source = "https://github.com/t3knoid/omada-openapi"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "flake8>=7.0.0",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "omada_openapi.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["omada_openapi*"]
+
+[tool.setuptools.package-data]
+omada_openapi = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    # Tests intentionally use verify_ssl=False; suppress the expected warning.
+    "ignore::urllib3.exceptions.InsecureRequestWarning",
+]
