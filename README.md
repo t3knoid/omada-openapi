@@ -1,26 +1,18 @@
 # omada-openapi
 
-A Python client for the **TP-Link Omada Open API** (Northbound API), the
-official, documented API for Omada SDN controllers.
+A Python client for the **TP-Link Omada Open API** (Northbound API), the official, documented API for Omada SDN controllers.
 
 It handles the parts every Open API integration needs:
 
 - **Authentication** — both official OAuth2 modes:
   - **Client Credentials Mode** — Client ID + Secret
   - **Authorization Code Mode** — three-step flow with a controller user
-- **Discovery** — controller ID (`omadacId`) from `/api/info`, and site lookup
-  by name
-- **Rate limiting** — every call is paced, and the controller's "too many
-  requests" answer (`errorCode -7132` or HTTP 429) is retried with
-  exponential backoff, honouring `Retry-After`; the pacing widens for the rest
-  of the run when the controller pushes back
+- **Discovery** — controller ID (`omadacId`) from `/api/info`, and site lookup by name
+- **Rate limiting** — every call is paced, and the controller's "too many requests" answer (`errorCode -7132` or HTTP 429) is retried with exponential backoff, honouring `Retry-After`; the pacing widens for the rest of the run when the controller pushes back
 - **Pagination** — `get_paged()` walks `page` / `pageSize` and returns one list
-- **Credential redaction** — `redact()` masks passphrases, shared secrets and
-  private keys anywhere in a response
+- **Credential redaction** — `redact()` masks passphrases, shared secrets and private keys anywhere in a response
 
-The client is read-oriented and returns the controller's JSON (`dict` /
-`list`) as is. Call any endpoint with `get()`, `post()` or `get_paged()`, or
-subclass `OmadaOpenApiClient` to add your own `get_*` methods.
+The client is read-oriented and returns the controller's JSON (`dict` / `list`) as is. Call any endpoint with `get()`, `post()` or `get_paged()`, or subclass `OmadaOpenApiClient` to add your own `get_*` methods.
 
 ## Install
 
@@ -61,12 +53,9 @@ jumbo = client.get(f"sites/{site_id}/jumbo")
 port_forwards = client.get_paged(f"sites/{site_id}/nat/port-forwardings")
 ```
 
-For **Authorization Code Mode**, use `openapi_auth_code_login(base_url,
-omadac_id, client_id, client_secret, username, password)` instead of
-`openapi_login`; it returns the same `OpenApiLoginResult`.
+For **Authorization Code Mode**, use `openapi_auth_code_login(base_url, omadac_id, client_id, client_secret, username, password)` instead of `openapi_login`; it returns the same `OpenApiLoginResult`.
 
-Paths are relative to `/openapi/v1/{omadacId}/`. Pass `api_version="v2"` for
-the endpoints that live under `/openapi/v2/`.
+Paths are relative to `/openapi/v1/{omadacId}/`. Pass `api_version="v2"` for the endpoints that live under `/openapi/v2/`.
 
 ## API
 
@@ -105,8 +94,7 @@ flake8 . --max-line-length=120
 
 ## Projects using it
 
-- [omada_network](https://github.com/t3knoid/omada_network) — exports an
-  Omada site's configuration to YAML and Markdown documentation
+- [omada_network](https://github.com/t3knoid/omada_network) — exports an Omada site's configuration to YAML and Markdown documentation
 
 ## License
 
