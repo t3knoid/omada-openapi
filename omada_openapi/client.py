@@ -16,10 +16,14 @@ This module provides:
 * :func:`discover_controller_id` — ``GET /api/info`` to find omadacId.
 * :func:`openapi_login` — Client Credentials Mode token exchange.
 * :func:`openapi_auth_code_login` — Authorization Code Mode (3-step).
+* :func:`openapi_refresh_token` — exchange a refresh token for a new
+  access token.
 * :func:`openapi_discover_site` / :func:`openapi_discover_site_id` — list
   sites and select one by name.
 * :class:`OmadaOpenApiClient` — paced, rate-limit-aware HTTP client with
-  pagination, credential redaction, and a few single-endpoint getters.
+  pagination, credential redaction, token renewal, and a few
+  single-endpoint getters.  :meth:`OmadaOpenApiClient.connect` logs in and
+  returns a client that renews its own token.
   Subclass it (or call :meth:`~OmadaOpenApiClient.get` /
   :meth:`~OmadaOpenApiClient.get_paged` directly) for anything else.
 """
@@ -31,7 +35,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin
 
 import requests
@@ -65,6 +69,11 @@ RATE_LIMIT_RETRIES = 6
 #: First backoff delay in seconds; doubled on each retry, capped below.
 RATE_LIMIT_BACKOFF = 2.0
 RATE_LIMIT_MAX_BACKOFF = 60.0
+#: Error codes meaning the access token has expired or is no longer valid.
+#: A client that can renew its token does so and retries the call once.
+TOKEN_ERROR_CODES = frozenset({-44112, -44113})
+#: Renew the access token this many seconds before it is due to expire.
+TOKEN_RENEW_MARGIN = 60.0
 
 # Indirection so tests can skip real waiting.
 _sleep = time.sleep
@@ -186,11 +195,32 @@ def discover_controller_id(
 
 @dataclass
 class OpenApiLoginResult:
-    """Result of a successful login (either auth mode)."""
+    """Result of a successful login (either auth mode) or token refresh."""
 
     access_token: str
     session: requests.Session
     base_url: str
+    #: Token for :func:`openapi_refresh_token`; empty if none was returned.
+    refresh_token: str = ""
+    #: Access-token lifetime in seconds, or ``None`` if not reported.
+    expires_in: float | None = None
+
+
+def _parse_token_body(body: dict[str, Any], what: str) -> tuple[str, str, float | None]:
+    """Return ``(access_token, refresh_token, expires_in)`` from a token response."""
+    error_code = body.get("errorCode", -1)
+    if error_code != 0:
+        raise OmadaAPIError(error_code, body.get("msg", f"{what} failed"))
+    result = body.get("result") or {}
+    access_token = result.get("accessToken", "")
+    if not access_token:
+        raise RuntimeError(f"{what} succeeded but no accessToken was returned")
+    expires_in = result.get("expiresIn")
+    try:
+        expires = float(expires_in) if expires_in is not None else None
+    except (TypeError, ValueError):
+        expires = None
+    return access_token, result.get("refreshToken", "") or "", expires
 
 
 def openapi_login(
@@ -230,23 +260,13 @@ def openapi_login(
         timeout=timeout,
     ))
     resp.raise_for_status()
-    body = resp.json()
-
-    error_code = body.get("errorCode", -1)
-    if error_code != 0:
-        raise OmadaAPIError(error_code, body.get("msg", "unknown error"))
-
-    result = body.get("result", {})
-    access_token = result.get("accessToken", "")
-    if not access_token:
-        raise RuntimeError(
-            "Open API login succeeded but no accessToken was returned"
-        )
+    access_token, refresh_token, expires_in = _parse_token_body(resp.json(), "Open API login")
 
     sess.headers.update({"Authorization": f"AccessToken={access_token}"})
     logger.info("Client Credentials login successful — token obtained")
     return OpenApiLoginResult(
         access_token=access_token, session=sess, base_url=base,
+        refresh_token=refresh_token, expires_in=expires_in,
     )
 
 
@@ -350,19 +370,9 @@ def openapi_auth_code_login(
         timeout=timeout,
     ))
     token_resp.raise_for_status()
-    token_body = token_resp.json()
-
-    token_error = token_body.get("errorCode", -1)
-    if token_error != 0:
-        raise OmadaAPIError(token_error, token_body.get("msg", "token exchange failed"))
-
-    token_result = token_body.get("result", {})
-    access_token = token_result.get("accessToken", "")
-    if not access_token:
-        raise RuntimeError(
-            "Authorization Code token exchange succeeded but no accessToken "
-            "was returned"
-        )
+    access_token, refresh_token, expires_in = _parse_token_body(
+        token_resp.json(), "Authorization Code token exchange",
+    )
 
     # Prepare session for subsequent API calls
     sess.headers.update({"Authorization": f"AccessToken={access_token}"})
@@ -371,6 +381,50 @@ def openapi_auth_code_login(
     logger.info("Authorization Code login successful — token obtained")
     return OpenApiLoginResult(
         access_token=access_token, session=sess, base_url=base,
+        refresh_token=refresh_token, expires_in=expires_in,
+    )
+
+
+def openapi_refresh_token(
+    base_url: str,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    *,
+    session: requests.Session | None = None,
+    verify_ssl: bool = True,
+    timeout: int = 30,
+) -> OpenApiLoginResult:
+    """Exchange a refresh token for a new access token (either auth mode).
+
+    Endpoint: ``POST /openapi/authorize/token?grant_type=refresh_token``
+
+    *session* is reused (and its ``Authorization`` header updated) when
+    given; otherwise a new session is created.  The returned result carries
+    the new refresh token when the controller issues one.
+    """
+    sess = session if session is not None else _make_session(verify_ssl, base_url)
+    base = base_url.rstrip("/")
+    token_url = f"{base}/openapi/authorize/token"
+
+    resp = _send_with_rate_limit("token refresh", lambda: sess.post(
+        token_url,
+        params={
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+        },
+        timeout=timeout,
+    ))
+    resp.raise_for_status()
+    access_token, new_refresh, expires_in = _parse_token_body(resp.json(), "Token refresh")
+
+    sess.headers.update({"Authorization": f"AccessToken={access_token}"})
+    logger.info("Access token refreshed")
+    return OpenApiLoginResult(
+        access_token=access_token, session=sess, base_url=base,
+        refresh_token=new_refresh or refresh_token, expires_in=expires_in,
     )
 
 
@@ -481,8 +535,18 @@ class OmadaOpenApiClient:
 
     Every call is paced (see *request_interval*) and retried with backoff
     while the controller answers "too many requests".  Use :meth:`get`,
-    :meth:`post` and :meth:`get_paged` for any Open API path; the ``get_*``
-    methods cover a few common endpoints.
+    :meth:`get_paged`, :meth:`post`, :meth:`put`, :meth:`patch` and
+    :meth:`delete` for any Open API path; the ``get_*`` methods cover a few
+    common endpoints.
+
+    **Token renewal.**  Built with :meth:`connect`, or given *client_id*,
+    *client_secret* and *refresh_token* (and/or *relogin*), the client renews
+    its access token shortly before *expires_in* runs out, and again whenever
+    the controller reports the token expired or invalid (HTTP 401 or one of
+    :data:`TOKEN_ERROR_CODES`), then retries the call once.  It first tries
+    the refresh token and falls back to *relogin* if that fails.  Without
+    those, the token is used as given and an expired token raises
+    :class:`OmadaAPIError`.
 
     Parameters
     ----------
@@ -499,6 +563,13 @@ class OmadaOpenApiClient:
     session:
         An authenticated :class:`requests.Session` (from
         :func:`openapi_login`).
+    refresh_token, expires_in:
+        From the login result; enable token renewal.
+    client_id, client_secret:
+        Open API application credentials, needed to use *refresh_token*.
+    relogin:
+        Zero-argument callable returning a fresh :class:`OpenApiLoginResult`;
+        used when there is no refresh token or refreshing fails.
     """
 
     def __init__(
@@ -511,8 +582,19 @@ class OmadaOpenApiClient:
         timeout: int = 30,
         session: requests.Session | None = None,
         request_interval: float | None = None,
+        refresh_token: str = "",
+        expires_in: float | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        relogin: Callable[[], OpenApiLoginResult] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.refresh_token = refresh_token
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._relogin = relogin
+        self._token_expires_at: float | None = None
+        self._set_expiry(expires_in)
         #: Minimum seconds between API calls.  Starts at *request_interval*
         #: (default ``$OMADA_REQUEST_INTERVAL`` or 0.2s) and widens when the
         #: controller answers "too many requests".
@@ -544,6 +626,121 @@ class OmadaOpenApiClient:
                     urllib3.exceptions.InsecureRequestWarning,
                     stacklevel=2,
                 )
+
+    @classmethod
+    def connect(
+        cls,
+        base_url: str,
+        client_id: str,
+        client_secret: str,
+        *,
+        omadac_id: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        verify_ssl: bool = True,
+        timeout: int = 30,
+        request_interval: float | None = None,
+    ) -> OmadaOpenApiClient:
+        """Log in and return a client that renews its own access token.
+
+        Uses Client Credentials Mode, or Authorization Code Mode when
+        *username* and *password* are given.  *omadac_id* is discovered from
+        ``/api/info`` when omitted.
+        """
+        if omadac_id is None:
+            omadac_id = discover_controller_id(base_url, verify_ssl=verify_ssl, timeout=timeout)
+        cid: str = omadac_id
+
+        def relogin() -> OpenApiLoginResult:
+            if username is not None and password is not None:
+                return openapi_auth_code_login(
+                    base_url, cid, client_id, client_secret, username, password,
+                    verify_ssl=verify_ssl, timeout=timeout,
+                )
+            return openapi_login(
+                base_url, cid, client_id, client_secret,
+                verify_ssl=verify_ssl, timeout=timeout,
+            )
+
+        login = relogin()
+        return cls(
+            login.base_url, cid, login.access_token,
+            verify_ssl=verify_ssl, timeout=timeout, session=login.session,
+            request_interval=request_interval,
+            refresh_token=login.refresh_token, expires_in=login.expires_in,
+            client_id=client_id, client_secret=client_secret, relogin=relogin,
+        )
+
+    # ------------------------------------------------------------------
+    # Token renewal
+    # ------------------------------------------------------------------
+
+    @property
+    def session(self) -> requests.Session:
+        """The authenticated session, e.g. for :func:`openapi_discover_site`."""
+        return self._session
+
+    @property
+    def can_renew_token(self) -> bool:
+        """Whether this client has what it needs to renew its access token."""
+        has_refresh = bool(self.refresh_token and self._client_id and self._client_secret)
+        return has_refresh or self._relogin is not None
+
+    def _set_expiry(self, expires_in: float | None) -> None:
+        self._token_expires_at = None if expires_in is None else _monotonic() + expires_in
+
+    def _token_due(self) -> bool:
+        return (
+            self._token_expires_at is not None
+            and _monotonic() >= self._token_expires_at - TOKEN_RENEW_MARGIN
+        )
+
+    def renew_token(self) -> None:
+        """Get a new access token now: refresh token first, then *relogin*.
+
+        Raises :class:`RuntimeError` if the client has no way to renew, or the
+        last renewal error if every way failed.
+        """
+        if not self.can_renew_token:
+            raise RuntimeError(
+                "Cannot renew the access token: no refresh token with client "
+                "credentials, and no relogin callable"
+            )
+        result: OpenApiLoginResult | None = None
+        error: Exception | None = None
+        if self.refresh_token and self._client_id and self._client_secret:
+            try:
+                result = openapi_refresh_token(
+                    self.base_url, self._client_id, self._client_secret,
+                    self.refresh_token, session=self._session, timeout=self.timeout,
+                )
+            except (OmadaAPIError, RuntimeError, requests.RequestException) as exc:
+                error = exc
+                logger.info("Token refresh failed (%s)%s", exc,
+                            "; logging in again" if self._relogin else "")
+        if result is None and self._relogin is not None:
+            result = self._relogin()
+        if result is None:
+            assert error is not None
+            raise error
+        self._apply_token(result)
+
+    def _apply_token(self, result: OpenApiLoginResult) -> None:
+        self.access_token = result.access_token
+        if result.refresh_token:
+            self.refresh_token = result.refresh_token
+        self._set_expiry(result.expires_in)
+        self._session.headers.update({"Authorization": f"AccessToken={result.access_token}"})
+
+    @staticmethod
+    def _is_token_error(resp: requests.Response) -> bool:
+        if resp.status_code == 401:
+            return True
+        try:
+            body = resp.json()
+        except ValueError:
+            return False
+        return isinstance(body, dict) and body.get("errorCode") in TOKEN_ERROR_CODES
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -598,15 +795,33 @@ class OmadaOpenApiClient:
 
         def send() -> requests.Response:
             self._throttle()
+            logger.debug("OPENAPI %s %s params=%s", method, url, params)
+            if method == "GET":
+                return self._session.get(url, params=params or {}, timeout=self.timeout)
             if method == "POST":
-                logger.debug("OPENAPI POST %s", url)
                 return self._session.post(url, json=payload, timeout=self.timeout)
-            logger.debug("OPENAPI GET %s params=%s", url, params)
-            return self._session.get(url, params=params or {}, timeout=self.timeout)
+            if method == "PUT":
+                return self._session.put(url, json=payload, timeout=self.timeout)
+            if method == "PATCH":
+                return self._session.patch(url, json=payload, timeout=self.timeout)
+            if method == "DELETE":
+                return self._session.delete(url, params=params or {}, json=payload, timeout=self.timeout)
+            raise ValueError(f"Unsupported HTTP method: {method}")
 
-        resp = _send_with_rate_limit(
-            path, send, lambda attempt, wait: self._on_rate_limited(path, attempt, wait),
-        )
+        def send_paced() -> requests.Response:
+            return _send_with_rate_limit(
+                path, send, lambda attempt, wait: self._on_rate_limited(path, attempt, wait),
+            )
+
+        can_renew = self.can_renew_token
+        if can_renew and self._token_due():
+            logger.debug("Access token about to expire; renewing")
+            self.renew_token()
+        resp = send_paced()
+        if can_renew and self._is_token_error(resp):
+            logger.info("Access token rejected on %s; renewing and retrying", path)
+            self.renew_token()
+            resp = send_paced()
         resp.raise_for_status()
         body: dict[str, Any] = resp.json()
         logger.debug(
@@ -649,6 +864,38 @@ class OmadaOpenApiClient:
         ``switches/ports/select``).
         """
         body = self._request("POST", path, payload=payload, api_version=api_version)
+        return body.get("result", body)
+
+    def put(self, path: str, payload: dict[str, Any], *, api_version: str = "v1") -> Any:
+        """PUT *payload* to an Open API *path* (replace a resource or setting).
+
+        Returns the response's ``result`` payload (often ``None`` for writes).
+        """
+        body = self._request("PUT", path, payload=payload, api_version=api_version)
+        return body.get("result", body)
+
+    def patch(self, path: str, payload: dict[str, Any], *, api_version: str = "v1") -> Any:
+        """PATCH *payload* to an Open API *path* (partially update a resource).
+
+        Returns the response's ``result`` payload (often ``None`` for writes).
+        """
+        body = self._request("PATCH", path, payload=payload, api_version=api_version)
+        return body.get("result", body)
+
+    def delete(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        *,
+        api_version: str = "v1",
+    ) -> Any:
+        """DELETE an Open API *path* and return the ``result`` payload.
+
+        *payload* is sent as a JSON body for the endpoints that take one
+        (e.g. batch deletes).
+        """
+        body = self._request("DELETE", path, params=params, payload=payload, api_version=api_version)
         return body.get("result", body)
 
     def get_paged(

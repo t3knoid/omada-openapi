@@ -17,6 +17,7 @@ from omada_openapi.client import (
     openapi_discover_site,
     openapi_discover_site_id,
     openapi_login,
+    openapi_refresh_token,
 )
 from omada_openapi.redaction import REDACTED
 
@@ -610,3 +611,205 @@ class TestPublicApi:
         assert omada_openapi.normalize_mac(" aa:bb:cc:dd:ee:ff ") == "AA-BB-CC-DD-EE-FF"
         for name in omada_openapi.__all__:
             assert hasattr(omada_openapi, name)
+
+
+# ---------------------------------------------------------------------------
+# Write methods
+# ---------------------------------------------------------------------------
+
+class TestWriteMethods:
+    _OK = {"errorCode": 0, "msg": "Success."}
+
+    def test_put_sends_json_body(self, openapi_client: OmadaOpenApiClient) -> None:
+        with patch.object(openapi_client._session, "put", return_value=_mock_response(self._OK)) as put:
+            result = openapi_client.put("sites/s1/setting", {"name": "x"})
+        assert result == self._OK
+        url = put.call_args.args[0]
+        assert url == "https://192.168.1.1/openapi/v1/ctrl-001/sites/s1/setting"
+        assert put.call_args.kwargs["json"] == {"name": "x"}
+
+    def test_patch_returns_result(self, openapi_client: OmadaOpenApiClient) -> None:
+        resp = {"errorCode": 0, "result": {"id": "n1"}}
+        with patch.object(openapi_client._session, "patch", return_value=_mock_response(resp)) as p:
+            assert openapi_client.patch("sites/s1/lan-networks/n1", {"vlan": 10}) == {"id": "n1"}
+        assert p.call_args.kwargs["json"] == {"vlan": 10}
+
+    def test_delete_with_params_and_body(self, openapi_client: OmadaOpenApiClient) -> None:
+        with patch.object(openapi_client._session, "delete", return_value=_mock_response(self._OK)) as d:
+            openapi_client.delete("sites/s1/things", params={"force": "true"}, payload={"ids": ["a"]})
+        assert d.call_args.kwargs["params"] == {"force": "true"}
+        assert d.call_args.kwargs["json"] == {"ids": ["a"]}
+
+    def test_write_error_raises(self, openapi_client: OmadaOpenApiClient) -> None:
+        with patch.object(openapi_client._session, "put",
+                          return_value=_mock_response({"errorCode": -1001, "msg": "Invalid"})):
+            with pytest.raises(OmadaAPIError) as exc:
+                openapi_client.put("sites/s1/setting", {})
+        assert exc.value.error_code == -1001
+
+    def test_write_is_retried_when_rate_limited(self, openapi_client: OmadaOpenApiClient) -> None:
+        limited = _mock_response({"errorCode": -7132, "msg": "Too many requests"})
+        with patch.object(openapi_client._session, "delete",
+                          side_effect=[limited, _mock_response(self._OK)]) as d:
+            openapi_client.delete("sites/s1/things/1")
+        assert d.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Token refresh and renewal
+# ---------------------------------------------------------------------------
+
+def _token(access: str, refresh: str = "", expires_in: int | None = 7200) -> dict:
+    result: dict = {"accessToken": access, "tokenType": "bearer"}
+    if refresh:
+        result["refreshToken"] = refresh
+    if expires_in is not None:
+        result["expiresIn"] = expires_in
+    return {"errorCode": 0, "msg": "Open API Get Access Token successfully.", "result": result}
+
+
+_EXPIRED = {"errorCode": -44112, "msg": "The access token has expired."}
+
+
+class TestRefreshToken:
+    def test_login_returns_refresh_token_and_expiry(self) -> None:
+        with patch("omada_openapi.client._make_session") as factory:
+            sess = MagicMock(spec=requests.Session)
+            sess.post.return_value = _mock_response(_token("a1", "r1", 7200))
+            sess.headers = {}
+            factory.return_value = sess
+            result = openapi_login("https://c", "ctrl", "id", "secret")
+        assert result.refresh_token == "r1"
+        assert result.expires_in == 7200
+
+    def test_refresh_posts_grant_and_updates_session(self) -> None:
+        sess = MagicMock(spec=requests.Session)
+        sess.headers = {}
+        sess.post.return_value = _mock_response(_token("a2", "r2"))
+        result = openapi_refresh_token("https://c/", "id", "secret", "r1", session=sess)
+        params = sess.post.call_args.kwargs["params"]
+        assert params == {"grant_type": "refresh_token", "client_id": "id",
+                          "client_secret": "secret", "refresh_token": "r1"}
+        assert sess.post.call_args.args[0] == "https://c/openapi/authorize/token"
+        assert sess.headers["Authorization"] == "AccessToken=a2"
+        assert (result.access_token, result.refresh_token) == ("a2", "r2")
+
+    def test_refresh_keeps_old_refresh_token_when_none_returned(self) -> None:
+        sess = MagicMock(spec=requests.Session)
+        sess.headers = {}
+        sess.post.return_value = _mock_response(_token("a2"))
+        assert openapi_refresh_token("https://c", "id", "s", "r1", session=sess).refresh_token == "r1"
+
+    def test_refresh_error_raises(self) -> None:
+        sess = MagicMock(spec=requests.Session)
+        sess.post.return_value = _mock_response({"errorCode": -44114, "msg": "Refresh token expired"})
+        with pytest.raises(OmadaAPIError):
+            openapi_refresh_token("https://c", "id", "s", "r1", session=sess)
+
+
+class TestTokenRenewal:
+    @pytest.fixture()
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        now = [1000.0]
+        monkeypatch.setattr("omada_openapi.client._monotonic", lambda: now[0])
+        return now
+
+    def _client(self, **kwargs) -> OmadaOpenApiClient:  # noqa: ANN003
+        defaults: dict = dict(verify_ssl=False, refresh_token="r1", client_id="id",
+                              client_secret="secret", expires_in=7200)
+        defaults.update(kwargs)
+        return OmadaOpenApiClient("https://c", "ctrl", "a1", **defaults)
+
+    def test_no_renewal_without_credentials(self, openapi_client: OmadaOpenApiClient) -> None:
+        assert not openapi_client.can_renew_token
+        with patch.object(openapi_client._session, "get", return_value=_mock_response(_EXPIRED)) as get:
+            with pytest.raises(OmadaAPIError) as exc:
+                openapi_client.get("sites")
+        assert exc.value.error_code == -44112
+        assert get.call_count == 1
+        with pytest.raises(RuntimeError):
+            openapi_client.renew_token()
+
+    def test_expired_token_is_refreshed_and_call_retried(self, clock: list[float]) -> None:
+        client = self._client()
+        ok = _mock_response({"errorCode": 0, "result": ["site"]})
+        with patch.object(client._session, "get", side_effect=[_mock_response(_EXPIRED), ok]) as get, \
+                patch.object(client._session, "post", return_value=_mock_response(_token("a2", "r2"))) as post:
+            assert client.get("sites") == ["site"]
+        assert get.call_count == 2
+        assert post.call_args.kwargs["params"]["refresh_token"] == "r1"
+        assert client.access_token == "a2"
+        assert client.refresh_token == "r2"
+        assert client._session.headers["Authorization"] == "AccessToken=a2"
+
+    def test_http_401_triggers_renewal(self, clock: list[float]) -> None:
+        client = self._client()
+        unauthorized = _mock_response({}, status_code=401)
+        ok = _mock_response({"errorCode": 0, "result": {}})
+        with patch.object(client._session, "put", side_effect=[unauthorized, ok]) as put, \
+                patch.object(client._session, "post", return_value=_mock_response(_token("a2"))):
+            client.put("sites/s1/setting", {"a": 1})
+        assert put.call_count == 2
+
+    def test_retried_only_once(self, clock: list[float]) -> None:
+        client = self._client()
+        with patch.object(client._session, "get", return_value=_mock_response(_EXPIRED)) as get, \
+                patch.object(client._session, "post", return_value=_mock_response(_token("a2"))):
+            with pytest.raises(OmadaAPIError):
+                client.get("sites")
+        assert get.call_count == 2
+
+    def test_renews_before_expiry(self, clock: list[float]) -> None:
+        client = self._client(expires_in=600)
+        ok = _mock_response({"errorCode": 0, "result": []})
+        refreshed = _mock_response(_token("a2", expires_in=600))
+        with patch.object(client._session, "get", return_value=ok), \
+                patch.object(client._session, "post", return_value=refreshed) as post:
+            client.get("sites")
+            assert post.call_count == 0
+            clock[0] += 600 - 30  # inside TOKEN_RENEW_MARGIN
+            client.get("sites")
+            assert post.call_count == 1
+            client.get("sites")
+            assert post.call_count == 1  # new expiry pushed out
+        assert client.access_token == "a2"
+
+    def test_falls_back_to_relogin_when_refresh_fails(self, clock: list[float]) -> None:
+        new_sess = MagicMock(spec=requests.Session)
+        relogin = MagicMock(return_value=OpenApiLoginResult("a3", new_sess, "https://c", "r3", 7200))
+        client = self._client(relogin=relogin)
+        ok = _mock_response({"errorCode": 0, "result": []})
+        refresh_failed = _mock_response({"errorCode": -44114, "msg": "Refresh token expired"})
+        with patch.object(client._session, "get", side_effect=[_mock_response(_EXPIRED), ok]), \
+                patch.object(client._session, "post", return_value=refresh_failed):
+            client.get("sites")
+        relogin.assert_called_once()
+        assert (client.access_token, client.refresh_token) == ("a3", "r3")
+        assert client._session.headers["Authorization"] == "AccessToken=a3"
+
+    def test_relogin_only(self, clock: list[float]) -> None:
+        relogin = MagicMock(return_value=OpenApiLoginResult("a3", MagicMock(), "https://c"))
+        client = OmadaOpenApiClient("https://c", "ctrl", "a1", verify_ssl=False, relogin=relogin)
+        assert client.can_renew_token
+        client.renew_token()
+        assert client.access_token == "a3"
+
+    def test_connect_logs_in_and_wires_renewal(self) -> None:
+        login = OpenApiLoginResult("a1", requests.Session(), "https://c", "r1", 7200)
+        with patch("omada_openapi.client.discover_controller_id", return_value="ctrl") as discover, \
+                patch("omada_openapi.client.openapi_login", return_value=login) as do_login:
+            client = OmadaOpenApiClient.connect("https://c", "id", "secret")
+        discover.assert_called_once()
+        do_login.assert_called_once()
+        assert client.omadac_id == "ctrl"
+        assert client.access_token == "a1"
+        assert client.refresh_token == "r1"
+        assert client.can_renew_token
+        assert client._session is login.session
+
+    def test_connect_uses_auth_code_mode_with_user_credentials(self) -> None:
+        login = OpenApiLoginResult("a1", requests.Session(), "https://c")
+        with patch("omada_openapi.client.openapi_auth_code_login", return_value=login) as do_login:
+            OmadaOpenApiClient.connect("https://c", "id", "secret", omadac_id="ctrl",
+                                       username="u", password="p")
+        assert do_login.call_args.args == ("https://c", "ctrl", "id", "secret", "u", "p")

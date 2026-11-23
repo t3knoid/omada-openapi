@@ -7,12 +7,13 @@ It handles the parts every Open API integration needs:
 - **Authentication** — both official OAuth2 modes:
   - **Client Credentials Mode** — Client ID + Secret
   - **Authorization Code Mode** — three-step flow with a controller user
+- **Token renewal** — the access token is refreshed shortly before it expires, and again if the controller rejects it, then the call is retried; if the refresh token has also expired, the client logs in again
 - **Discovery** — controller ID (`omadacId`) from `/api/info`, and site lookup by name
 - **Rate limiting** — every call is paced, and the controller's "too many requests" answer (`errorCode -7132` or HTTP 429) is retried with exponential backoff, honouring `Retry-After`; the pacing widens for the rest of the run when the controller pushes back
 - **Pagination** — `get_paged()` walks `page` / `pageSize` and returns one list
 - **Credential redaction** — `redact()` masks passphrases, shared secrets and private keys anywhere in a response
 
-The client is read-oriented and returns the controller's JSON (`dict` / `list`) as is. Call any endpoint with `get()`, `post()` or `get_paged()`, or subclass `OmadaOpenApiClient` to add your own `get_*` methods.
+The client returns the controller's JSON (`dict` / `list`) as is. Call any endpoint with `get()`, `get_paged()`, `post()`, `put()`, `patch()` or `delete()`, or subclass `OmadaOpenApiClient` to add your own methods.
 
 ## Install
 
@@ -25,26 +26,13 @@ Requires Python 3.10+. Dependencies: `requests`, `urllib3`.
 ## Quick start
 
 ```python
-from omada_openapi import (
-    OmadaOpenApiClient,
-    discover_controller_id,
-    openapi_discover_site,
-    openapi_login,
-)
+from omada_openapi import OmadaOpenApiClient, openapi_discover_site
 
-base_url = "https://192.168.1.10:8043"
-omadac_id = discover_controller_id(base_url, verify_ssl=False)
-
-login = openapi_login(
-    base_url, omadac_id, "<client-id>", "<client-secret>", verify_ssl=False,
+client = OmadaOpenApiClient.connect(
+    "https://192.168.1.10:8043", "<client-id>", "<client-secret>", verify_ssl=False,
 )
 site_id, site_name = openapi_discover_site(
-    login.base_url, omadac_id, login.session, site_name="Home",
-)
-
-client = OmadaOpenApiClient(
-    login.base_url, omadac_id, login.access_token,
-    session=login.session,
+    client.base_url, client.omadac_id, client.session, site_name="Home",
 )
 
 devices = client.get_devices(site_id)
@@ -53,7 +41,19 @@ jumbo = client.get(f"sites/{site_id}/jumbo")
 port_forwards = client.get_paged(f"sites/{site_id}/nat/port-forwardings")
 ```
 
-For **Authorization Code Mode**, use `openapi_auth_code_login(base_url, omadac_id, client_id, client_secret, username, password)` instead of `openapi_login`; it returns the same `OpenApiLoginResult`.
+`connect()` discovers the controller ID, logs in, and keeps the token fresh for as long as the client runs. For **Authorization Code Mode**, also pass `username=` and `password=`.
+
+To log in yourself instead, call `openapi_login(base_url, omadac_id, client_id, client_secret)` or `openapi_auth_code_login(base_url, omadac_id, client_id, client_secret, username, password)` and pass the result to the constructor. The client renews its token only if you also give it `refresh_token=login.refresh_token`, `expires_in=login.expires_in`, `client_id` and `client_secret`, or a `relogin` callable.
+
+### Making changes
+
+```python
+client.put(f"sites/{site_id}/setting/...", {...})
+client.patch(f"sites/{site_id}/lan-networks/{network_id}", {"vlan": 20})
+client.delete(f"sites/{site_id}/...")
+```
+
+These calls change the controller's live configuration. Check the request body against your controller's API reference first, since the expected fields vary by controller version.
 
 Paths are relative to `/openapi/v1/{omadacId}/`. Pass `api_version="v2"` for the endpoints that live under `/openapi/v2/`.
 
@@ -62,12 +62,17 @@ Paths are relative to `/openapi/v1/{omadacId}/`. Pass `api_version="v2"` for the
 | Name | Description |
 | --- | --- |
 | `discover_controller_id(base_url)` | Read `omadacId` from `GET /api/info` (no auth) |
-| `openapi_login(...)` | Client Credentials Mode; returns `OpenApiLoginResult(access_token, session, base_url)` |
+| `OmadaOpenApiClient.connect(base_url, client_id, client_secret, ...)` | Discover, log in, and return a client that renews its own token |
+| `openapi_login(...)` | Client Credentials Mode; returns `OpenApiLoginResult(access_token, session, base_url, refresh_token, expires_in)` |
 | `openapi_auth_code_login(...)` | Authorization Code Mode; same result |
+| `openapi_refresh_token(base_url, client_id, client_secret, refresh_token)` | Exchange a refresh token for a new access token; same result |
 | `openapi_discover_site(...)` | Return `(site_id, site_name)`; matches `site_name` case-insensitively, or auto-selects the only site |
 | `OmadaOpenApiClient.get(path, params=None)` | GET and return the `result` payload |
 | `OmadaOpenApiClient.post(path, payload)` | POST a query body and return the `result` payload |
 | `OmadaOpenApiClient.get_paged(path)` | Fetch every page into one list |
+| `OmadaOpenApiClient.put(path, payload)` / `.patch(path, payload)` | Replace or partially update a resource; return the `result` payload |
+| `OmadaOpenApiClient.delete(path, params=None, payload=None)` | Delete a resource; return the `result` payload |
+| `OmadaOpenApiClient.renew_token()` | Renew the access token now (refresh token, then re-login) |
 | `OmadaOpenApiClient.get_devices(site_id)` | Adopted devices |
 | `OmadaOpenApiClient.get_networks(site_id)` | LAN networks |
 | `OmadaOpenApiClient.get_dhcp_leases(site_id)` | Current DHCP leases |
